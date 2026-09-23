@@ -1,0 +1,1889 @@
+From 2e8e9520add0e8226b829b116efbb9baa7dca57a Mon Sep 17 00:00:00 2001
+From: gcw_C4359EFc <ajya3pihOUzyMOOI.gcw_C4359EFc@noreply.gitcode.com>
+Date: Sun, 13 Sep 2026 13:05:44 +0700
+Subject: [PATCH] feat(evaluation): add Qwen3.5 MMStar and RealWorldQA support
+
+Add native VLMEval TSV MCQ datasets, deterministic scoring, response-only presence penalty and min_p. Synchronize accelerator generation timing and report weighted decode throughput.
+
+Use explicitly replicated inputs for the new MCQ tasks on current master; retain legacy partitioned inference and VQA behavior. Include 9B configs, launcher, practices and 91 CPU unit tests.
+
+Refs: https://gitcode.com/Ascend/MindSpeed-MM/issues/377
+
+Atlas smoke, full accuracy and performance evaluation are intentionally left to the target-machine tester.
+---
+ docs/zh/_menu.md                              |   4 +
+ ...qwen3_5_evaluation_performance_practice.md |  92 +++++++
+ .../qwen3_5_mcq_evaluation_practice.md        | 217 ++++++++++++++++
+ .../zh/guides/development/evaluation_guide.md |  16 +-
+ docs/zh/guides/development/inference_guide.md |  19 +-
+ examples/qwen3_5/README.md                    |  22 ++
+ examples/qwen3_5/evaluate_qwen3_5_9B.sh       |  47 ++++
+ .../qwen3_5/qwen3_5_9B_evaluation_mmstar.yaml |  58 +++++
+ .../qwen3_5_9B_evaluation_realworldqa.yaml    |  58 +++++
+ .../fsdp/evaluation/eval_datasets/__init__.py |   5 +
+ .../eval_datasets/vlmeval_mcq_dataset.py      | 167 ++++++++++++
+ .../fsdp/evaluation/eval_impl/__init__.py     |   3 +
+ .../evaluation/eval_impl/impl_vlmeval_mcq.py  | 108 ++++++++
+ .../fsdp/evaluation/evaluation_runner.py      |   1 +
+ mindspeed_mm/fsdp/inference/infer_engine.py   |  27 +-
+ .../fsdp/inference/inference_runner.py        |  11 +-
+ .../fsdp/inference/logits_processors.py       |  29 +++
+ mindspeed_mm/fsdp/params/inference_args.py    |  14 +-
+ .../evaluation/test_qwen3_5_eval_config.py    |  89 +++++++
+ tests/ut_fsdp/evaluation/test_vlmeval_mcq.py  | 245 ++++++++++++++++++
+ tests/ut_fsdp/inference/test_infer_engine.py  | 127 +++++++++
+ .../inference/test_inference_data_flow.py     | 111 ++++++++
+ .../inference/test_logits_processors.py       |  74 ++++++
+ 23 files changed, 1531 insertions(+), 13 deletions(-)
+ create mode 100644 docs/zh/features/qwen3_5_evaluation_performance_practice.md
+ create mode 100644 docs/zh/features/qwen3_5_mcq_evaluation_practice.md
+ create mode 100755 examples/qwen3_5/evaluate_qwen3_5_9B.sh
+ create mode 100644 examples/qwen3_5/qwen3_5_9B_evaluation_mmstar.yaml
+ create mode 100644 examples/qwen3_5/qwen3_5_9B_evaluation_realworldqa.yaml
+ create mode 100644 mindspeed_mm/fsdp/evaluation/eval_datasets/vlmeval_mcq_dataset.py
+ create mode 100644 mindspeed_mm/fsdp/evaluation/eval_impl/impl_vlmeval_mcq.py
+ create mode 100644 mindspeed_mm/fsdp/inference/logits_processors.py
+ create mode 100644 tests/ut_fsdp/evaluation/test_qwen3_5_eval_config.py
+ create mode 100644 tests/ut_fsdp/evaluation/test_vlmeval_mcq.py
+ create mode 100644 tests/ut_fsdp/inference/test_infer_engine.py
+ create mode 100644 tests/ut_fsdp/inference/test_inference_data_flow.py
+ create mode 100644 tests/ut_fsdp/inference/test_logits_processors.py
+
+diff --git a/docs/zh/_menu.md b/docs/zh/_menu.md
+index 501cd72..28bc8c7 100644
+--- a/docs/zh/_menu.md
++++ b/docs/zh/_menu.md
+@@ -25,7 +25,11 @@
+   - [确定性计算](./features/deterministic_computing.md)
+ - [模型迁移]()
+   - [迁移指南（基于FSDP2训练后端）](./features/fsdp2_qwen3vl_migration_practice.md)
++- [模型评测]()
++  - [评测框架使用指南](./guides/development/evaluation_guide.md)
++  - [Qwen3.5 多模态选择题评测实践](./features/qwen3_5_mcq_evaluation_practice.md)
+ - [模型性能调优](pytorch/performance_tuning.md)
++  - [Qwen3.5 评测性能优化实践](./features/qwen3_5_evaluation_performance_practice.md)
+ - [开发工具]()
+   - [性能数据采集](tools.md)
+   - [权重转换](pytorch/weight_conversion.md)
+diff --git a/docs/zh/features/qwen3_5_evaluation_performance_practice.md b/docs/zh/features/qwen3_5_evaluation_performance_practice.md
+new file mode 100644
+index 0000000..6b62fb9
+--- /dev/null
++++ b/docs/zh/features/qwen3_5_evaluation_performance_practice.md
+@@ -0,0 +1,92 @@
++# Qwen3.5 NPU 评测性能优化实践
++
++本篇承接[多模态选择题评测开发实践](qwen3_5_mcq_evaluation_practice.md)。
++当前只交付代码和复现方法，未执行 Atlas 推理或性能测试，所有硬件数据待测试。
++
++## 1. 指标定义
++
++| 指标 | 计算范围 | 注意事项 |
++| :--- | :--- | :--- |
++| 单样本 token/s | 输出 token / 本样本 generate 耗时 | 包括 thinking token，排除 prompt token |
++| 总 generate 耗时 | `sum(inference_duration)` | generate 前后同步设备，避免异步下发低估耗时 |
++| Decode throughput | `sum(output_token_count) / sum(inference_duration)` | 不是单样本 token/s 的算术平均，不乘 FSDP world size |
++| 推理循环耗时 | `Total inference duration` | 包括预处理、生成、解码、循环日志等，不含模型初始化 |
++| Overall inference speed | 输出 token / 推理循环耗时 | 保留旧汇总字段，与 Decode throughput 分开报告 |
++| 端到端耗时 | 进程启动至指标落盘 | 包含初始化、权重加载、图片缓存、结果写盘，须另行测量 |
++| 每 rank 峰值显存 | 每卡 NPU 峰值 allocated/reserved | 分别记录，不用单张卡或均值替代每 rank 峰值 |
++
++这里沿用任务书的名称 `Decode throughput`，但计时窗口是整个 `generate`，包含 prefill 和
++自回归 decode，**不是排除 prefill 后的纯 decode 性能**，也不能推导 TTFT。
++NPU/CUDA 算子异步执行，统一 `synchronize()` 在开始 `perf_counter()` 前以及 generate 返回后执行。
++CPU 单元测试通过替换同步函数和时钟检查调用顺序，不代表 NPU 同步实测。
++
++例如两个样本分别产生 2/3 个 token、耗时 1/3 秒，整体吞吐为 `5/4=1.25 tok/s`，
++不是 `(2/1+3/3)/2=1.5 tok/s`。新 MCQ 模式所有 rank 合作生成同一条响应，仅 rank 0
++记录一次，不能乘卡数。在原有按 rank 分发模式中，此加权指标的分母是各请求 generate
++耗时之和，并非并发服务的墙钟吞吐；后者应参考单独的循环耗时指标。
++
++## 2. 基线与 A/B 顺序
++
++先完成数据 MD5、完整 prompt、原始权重和 processor、thinking、全部采样参数的精度基线。
++两份默认配置的 `gdn_implementation` 和 `causal_conv1d_implementation` 均为 `eager`；
++`attn_implementation` 仍为 `flash_attention_2`，这里的 eager 指 GDN 和 causal conv1d 路径。
++
++| 实验 | GDN / causal conv1d | reshard_after_forward | 目的 |
++| :--- | :--- | :--- | :--- |
++| E0 | eager / eager | true | 精度基线 |
++| E1 | eager / eager | false | 隔离减少 decode 参数 all-gather 的收益 |
++| E2 | ascendc / ascendc | true | 隔离融合算子收益及精度变化 |
++| E3 | ascendc / ascendc | false | 显存允许时验证组合收益 |
++| E4 | 最佳候选 | 同最佳候选 | 完整精度验证后的生成上限试验 |
++
++按 E0 → E1 → E2 → E3 顺序比较；E4 仅是后续探索，不替代 `32768` 的正式基线。
++每次固定权重、数据、prompt、seed、图片分辨率和采样参数。不得通过关闭 thinking、降低分辨率、
++删除 presence penalty 或只报告速度不报告精度来宣称优化成功。
++
++AscendC 候选只修改：
++
++```yaml
++model:
++  gdn_implementation: ascendc
++  causal_conv1d_implementation: ascendc
++```
++
++按模型 README 安装匹配的 fla-npu/Triton-Ascend。首次执行可能含编译，保留冷启动日志；
++性能使用缓存后的第二轮，并报告缓存状态。各候选先十样本观察显存，再进行完整数据集精度。
++
++## 3. 显存与计时风险
++
++- `reshard_after_forward=false` 在 decode 中保留完整参数，用显存换通信；9B 可优先验证，
++  27B/35B-A3B 不应直接沿用，需要每 rank 峰值检查。
++- `max_new_tokens=32768` 与 thinking 长输出会增加 KV cache 和输出记录成本，OOM、截断、
++  未输出最终答案必须单独记录，不能靠评分器掩盖。
++- presence penalty 每 token 建立 seen mask 并扫描 response，长输出时存在额外开销；
++  这是固定生成口径的一部分。若将来优化实现，先对 prompt 排除、batch 独立和只罚一次语义做等价测试。
++- 图片缓存、权重加载和首次编译影响端到端时间，但不计入单样本 generate 时间；不得混报。
++- FSDP 各 rank 必须共同进入每次 generate，各节点 TSV、图片内容和样本顺序一致。
++  不要为增加吞吐而恢复 DistributedSampler 到这两个 MCQ 任务中。
++
++## 4. 目标机记录模板
++
++记录设备型号/卡数、每卡容量、驱动/CANN、Python、torch/torch-npu、Transformers、
++MindSpeed/MindSpeed-MM commit、fla-npu/Triton-Ascend、权重 revision、数据 MD5、配置、seed。
++用独立输出目录保存每次实验，禁止覆盖后丢失基线。
++
++下表需分别为 MMStar、RealWorldQA 填写；没有数据前保留“待测试”，不得填预计值。
++
++| 实验 | Accuracy | 生成耗时(s) | Decode tok/s | 端到端(s) | 每 rank 峰值/GiB | Invalid | 结论 |
++| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
++| E0 | 待测试 | 待测试 | 待测试 | 待测试 | 待测试 | 待测试 | 基线待验收 |
++| E1 | 待测试 | 待测试 | 待测试 | 待测试 | 待测试 | 待测试 | 待验收 |
++| E2 | 待测试 | 待测试 | 待测试 | 待测试 | 待测试 | 待测试 | 待验收 |
++| E3 | 待测试 | 待测试 | 待测试 | 待测试 | 待测试 | 待测试 | 待验收 |
++| E4 | 待测试 | 待测试 | 待测试 | 待测试 | 待测试 | 待测试 | 可选探索 |
++
++提升比例使用 `(candidate / baseline - 1) * 100%`，同时提供原始耗时、总输出 token 和两次
++完整精度，不能仅贴百分比。采样造成的输出长度变化也需报告，速度变化不一定全由算子加速造成。
++
++## 5. 推荐配置准入
++
++候选须同时满足：完整数据集精度按确认口径达标、invalid 不异常、目标卡数不 OOM、
++eager 与优化配置保留完整 A/B。随后回填两篇实践、Issue 和 PR，再决定是否把默认 eager
++配置改为融合配置。本提交不提前更改默认精度基线，也不宣称性能达标。
+diff --git a/docs/zh/features/qwen3_5_mcq_evaluation_practice.md b/docs/zh/features/qwen3_5_mcq_evaluation_practice.md
+new file mode 100644
+index 0000000..6ecdd1c
+--- /dev/null
++++ b/docs/zh/features/qwen3_5_mcq_evaluation_practice.md
+@@ -0,0 +1,217 @@
++# Qwen3.5 多模态选择题评测开发实践
++
++## 范围与状态
++
++本实践对应 [Issue #377：多模态理解评测能力](https://gitcode.com/Ascend/MindSpeed-MM/issues/377)，
++在 MindSpeed-MM 内接入 MMStar、RealWorldQA。数据格式参考 VLMEvalKit；模型加载、FSDP2、
++NPU 生成、答案抽取和评分均由 MindSpeed-MM 完成，不依赖 VLMEvalKit 运行时。
++
++开发基线为 Ascend 官方 GitHub 仓库 `master` 的
++`373b3e9542be065dec542fc914c8ef59fbe8005d`。相对于早期任务书基线，当前推理框架已使用
++`StatefulDistributedSampler`，因此本实现另行增加显式的 `replicated_inputs` 路径：
++这两个新任务的所有 rank 按相同顺序处理完整数据，共同调用 `generate`；只有 rank 0 解码、
++汇总并写出每条预测。原有推理和 `vqa2_val` 的数据分发、padding 和评分逻辑不变。
++
++本提交不运行真实模型评测。Atlas 800T A2/A3 的冒烟、全量精度、性能 A/B、Issue 结果回填及
++PR 合入均待目标机验证。Issue 页面在开发环境中无法直接读取，需求按提供的任务书实现；
++提交上游前还需核对 Issue 最新要求和实际目标分支，不能宣称已全部验收。
++
++## 1. 环境与权重
++
++Python 使用仓库要求的 3.12，依赖和扩展安装遵循 [Qwen3.5 README](../../../examples/qwen3_5/README.md)。
++当前模型 README 要求 Transformers 5.2.0；不要仅安装 `pyproject.toml` 的通用版本后直接运行。
++本功能不改变 Qwen3.5 模型结构或权重。
++
++在目标机记录以下快照，并保留 CANN/驱动、fla-npu、Triton-Ascend 和权重 revision：
++
++```bash
++npu-smi info
++python --version
++python -c 'import torch, torch_npu, transformers; print(torch.__version__, torch_npu.__version__, transformers.__version__)'
++pip show mindspeed mindspeed-mm
++git rev-parse HEAD
++```
++
++准备 `Qwen/Qwen3.5-9B` 原始权重和同一目录的 processor。修改下列 YAML 中的
++`/path/to/Qwen3.5-9B`；anchor 会同时更新加载路径和 processor 路径：
++
++- `examples/qwen3_5/qwen3_5_9B_evaluation_mmstar.yaml`
++- `examples/qwen3_5/qwen3_5_9B_evaluation_realworldqa.yaml`
++
++## 2. 数据准备与数据契约
++
++```bash
++mkdir -p data
++curl -fL https://opencompass.openxlab.space/utils/VLMEval/MMStar.tsv -o data/MMStar.tsv
++curl -fL https://opencompass.openxlab.space/utils/VLMEval/RealWorldQA.tsv -o data/RealWorldQA.tsv
++md5sum data/MMStar.tsv data/RealWorldQA.tsv
++```
++
++| 数据集 | 文件 | 参考 MD5 |
++| :--- | :--- | :--- |
++| MMStar | `MMStar.tsv` | `e1ecd2140806c1b1bbf54b43372efb9e` |
++| RealWorldQA | `RealWorldQA.tsv` | `4de008f55dc4fd008ca9e15321dc44b7` |
++
++参考值来自任务书所固定的 VLMEvalKit 数据版本。必须记录实际 MD5、下载日期、样本总数；
++若哈希不一致，先调查版本变化，不直接比较旧分数。代码不自动下载数据，也不静默替换版本。
++
++必需列为 `index`、`image`、`question`、`answer`、`A`、`B`，非空的 `C`～`Z` 为可选候选项。
++可选分组包括 `category`、`l2_category`（兼容 `l2-category`）和 `bench`。
++按字符串读取，保留前导零 ID 和选项文字中的 `NA`。全量检查空/重复 ID 后再截断
++`max_samples`，因此图片可引用截断范围以外的行。
++
++图片支持本地绝对/相对路径、base64、base64 data URI 和多级样本 ID 引用。
++真实路径优先，引用环会报错；只接受 magic bytes 为 PNG/JPEG/GIF/WEBP 的内容。
++解码图片缓存到 `<TSV目录>/.mindspeed_mm_cache/<dataset_name>/images/`，
++文件名为内容 SHA-256 前 24 位及真实格式后缀。临时文件 flush/fsync 后通过 `os.replace`
++原子发布，避免并发 rank 读取半文件。同内容、同大小的缓存直接复用。
++
++数据目录必须可写且空间充足；各节点必须使用内容相同、顺序相同的 TSV 及图片。
++本期不提供动态图片 batch、请求级数据并行或服务化推理。
++
++## 3. Prompt、生成参数和评分
++
++输入使用以下固定结构；不要混用其他 prompt 的结果：
++
++```text
++Question: <question>
++Options:
++A. <A text>
++B. <B text>
++...
++Please select the correct answer from the options above. Please show your choice in the `answer` field with only the choice letter, e.g., `"answer": "C"`.
++```
++
++9B 配置遵循任务书中的 Qwen3.5 thinking 口径：
++
++| 参数 | 值 |
++| :--- | :--- |
++| `enable_thinking` | `true` |
++| `max_new_tokens` | `32768` |
++| `do_sample` / `temperature` | `true` / `1.0` |
++| `top_p` / `top_k` / `min_p` | `0.95` / `20` / `0.0` |
++| `presence_penalty` / `repetition_penalty` | `1.5` / `1.0` |
++| `use_cache` / `seed` | `true` / `42` |
++
++presence penalty 只处理 response：生成阶段已经出现的 token 各减一次固定值，prompt token
++不计入。同一 token 重复出现不会累积扣减。每次 `generate` 都创建新的 processor，避免跨样本
++复用 prompt 长度。`min_p` 只在采样时传入；分布式运行保留 `synced_gpus=True`。
++
++答案抽取先删除最后一个 `</think>` 及其之前的文本，再按顺序尝试：结构化 `answer` 字段、
++明确的 answer 语句、LaTeX boxed、最后五个 token 内的唯一合法选项字母、短回答中的唯一
++选项文本。歧义选项（例如 `A or B`）、冲突的结构化答案、非法选项不猜测，返回 `None`。
++文本回退要求输出长度不超过选项总长度的两倍，并按词边界匹配，避免 `blueberry` 误命中 `blue`。
++
++整体分数为 `round(100 * correct / total, 2)`。无效答案计入分母；可抽取但答错的选项不计为
++invalid。不调用 LLM judge，也不通过修改抽取规则选择性追分。
++
++## 4. 启动与产物
++
++先设两个 YAML 的 `evaluation.max_samples: 10`，修改实际模型、数据路径，并 source 正确 CANN：
++
++```bash
++CANN_ENV_SCRIPT=/usr/local/Ascend/cann/set_env.sh \
++  bash examples/qwen3_5/evaluate_qwen3_5_9B.sh mmstar
++bash examples/qwen3_5/evaluate_qwen3_5_9B.sh realworldqa
++```
++
++脚本默认每节点 8 卡，支持外部设置 `NPUS_PER_NODE`、`MASTER_ADDR`、`MASTER_PORT`、
++`NNODES`、`NODE_RANK`。不合法的数据集参数以退出码 2 结束。
++日志为 `logs/eval_<dataset>_<timestamp>_node<rank>.log`；`pipefail` 保留 torchrun 的失败状态。
++
++冒烟应检查：所有 rank 顺利完成每次生成、无 HCCL 死锁、图片可读取、每输入一条预测、
++两个结果文件的 `total=10`，并人工核对原始输出及最终选项。
++之后恢复 `max_samples: null` 再运行全量评测。
++
++| 产物 | 内容 |
++| :--- | :--- |
++| `qwen3_5_mmstar_predictions.json` | ID、问题、选项、标准答案、原始输出、抽取选项、hit、分类 |
++| `qwen3_5_mmstar_metrics.json` | overall、correct、total、invalid_predictions、可用分类准确率 |
++| `qwen3_5_realworldqa_predictions.json` | 同上，对应 RealWorldQA |
++| `qwen3_5_realworldqa_metrics.json` | 同上，对应 RealWorldQA |
++
++默认保存到 `evaluation_outputs`。无分组字段时不输出相应分组。
++每次重跑会覆盖同 adapter/dataset 的文件；应使用独立输出目录或立即按模型/revision/commit/seed
++归档 YAML、日志、预测和指标。完整 thinking 输出可能较大，需要预留磁盘。
++
++## 5. 精度验收与问题定位
++
++任务书中的 Qwen3.5-9B 官方参考如下（不是本机实测）：
++
++| 数据集 | 官方参考 | 绝对差 <1 个百分点 | 相对误差 <1% | 本次实测 |
++| :--- | ---: | :--- | :--- | :--- |
++| RealWorldQA | 80.3 | `(79.3, 81.3)` | `(79.497, 81.103)` | 待测试 |
++| MMStar | 79.7 | `(78.7, 80.7)` | `(78.903, 80.497)` | 待测试 |
++
++全量评测前由任务负责人确认采用哪种 `<1%` 口径，提交时同时报告绝对百分点差和相对误差。
++验收使用开区间，不把恰好差 1 个百分点算作通过。上述分数不能直接用于 27B 或 MoE 验收。
++
++偏差排查顺序：数据 MD5/样本数 → 全量配置 → 权重/processor revision → thinking 和完整生成参数
++→ prompt → invalid 及截断 → eager/融合算子 A/B → CANN/torch-npu/Transformers/插件版本。
++采样边界附近应在相同条件下复跑并同时报告 seed 和两次结果，不能只保留较高分。
++
++## 6. 迁移到 27B / 35B-A3B
++
++27B 仍使用 dense 插件：复制 9B 配置并修改模型、加载和 processor 路径，保持
++`model_id: qwen3_5`、`adapter: qwen3_5` 和 `mindspeed_mm/fsdp/models/qwen3_5`。
++根据显存选择单机/多机 FSDP，从 `reshard_after_forward: true` 和十样本开始。
++
++35B-A3B 不能只换路径。以[评测指南](../guides/development/evaluation_guide.md)的 MoE 示例为底稿，
++保留本实践的 generation/evaluation 段，并同步修改：
++
++```yaml
++model:
++  model_id: qwen3_5_moe
++  use_grouped_expert_matmul: true
++inference:
++  adapter: qwen3_5_moe
++  plugin:
++    - mindspeed_mm/fsdp/models/qwen3_5_moe
++```
++
++FSDP plan 需包含 `model.language_model.layers.{*}.mlp.experts`，配置 `expert_parallel_size`、
++`ep_plan.apply_modules` 和适合目标卡数的 dispatcher/expert shard 大小。保持所有 rank
++处理相同样本。不要通过忽略缺失参数或部分加载绕过 dense/MoE 插件不匹配。
++
++## 7. 开发检查与 PR 清单
++
++在依赖已安装的 Python 3.12 环境执行（不加载模型）：
++
++```bash
++NON_MEGATRON=true python -m pytest -q \
++  tests/ut_fsdp/evaluation \
++  tests/ut_fsdp/inference
++python -m compileall -q mindspeed_mm/fsdp/evaluation mindspeed_mm/fsdp/inference mindspeed_mm/fsdp/params/inference_args.py
++bash -n examples/qwen3_5/evaluate_qwen3_5_9B.sh
++git diff --check
++```
++
++测试覆盖数据/缓存、抽取/评分、presence penalty、参数兼容性、同步计时、rank 0 去重、
++同样本与旧分发路径。runner 数据流测试替换未使用的模型加载边界；这不是 NPU 或 FSDP 实测。
++两份 YAML 还需经 YAML 解析器和配置类解析检查。
++
++### 本次开发机检查记录
++
++2026-09-13，在 Python 3.12.14 / torch 2.10.0+cpu / Transformers 5.2.0 /
++pandas 3.0.5 / Pydantic 2.13.5 / torchdata 0.11.0 / pytest 9.1.1 环境中，
++上述两个测试目录共 **91 项通过**。MindSpeed 测试依赖来自官方 GitHub commit
++`b3619901c0985f0b6f2ac9c4024de23bf31278b4`，通过 `PYTHONPATH` 使用该源码。
++Python 编译、两份 YAML 解析及 `EvaluationArguments` 构造、Shell 语法、启动参数/退出码、
++`git diff --check` 均通过。新增 Python 文件经 Black（行宽 120）格式化。
++
++保留一项来自基线 `BaseArguments.Config` 的 Pydantic 弃用警告，未改动无关配置基础设施。
++这些是合成小样本和模拟 adapter/rank 的 CPU 单元检查；没有启动 torchrun、加载真实权重、
++下载完整评测 TSV、运行完整仓库测试或执行任何 NPU/HCCL 验收。
++
++- [ ] Atlas 十样本冒烟及两个数据集全量完成；样本数一一对应。
++- [ ] 按确认口径回填官方值、实测值、绝对差、相对误差、invalid。
++- [ ] 完成 eager 和至少一个候选的[性能 A/B](qwen3_5_evaluation_performance_practice.md)。
++- [ ] 归档环境、权重 revision、MD5、YAML、日志、预测、指标。
++- [ ] 回填两篇实践到 Issue，核对 Issue 最新条款和 PR 目标分支。
++- [ ] PR 说明代码变更、测试、行为兼容性和未验证项；通过评审后再更新完成状态。
++
++## 参考
++
++- [Qwen3.5-9B 模型卡](https://huggingface.co/Qwen/Qwen3.5-9B)
++- [VLMEvalKit 数据定义](https://github.com/open-compass/VLMEvalKit/blob/main/vlmeval/dataset/image_mcq.py)
++- [VLMEvalKit 匹配逻辑](https://github.com/open-compass/VLMEvalKit/blob/main/vlmeval/utils/matching_util.py)
+diff --git a/docs/zh/guides/development/evaluation_guide.md b/docs/zh/guides/development/evaluation_guide.md
+index af1c9ab..e22641f 100644
+--- a/docs/zh/guides/development/evaluation_guide.md
++++ b/docs/zh/guides/development/evaluation_guide.md
+@@ -243,11 +243,25 @@ evaluation_outputs/
+ 
+ ## 适配范围
+ 
+-当前评测框架已适配和验证的评测数据集及评测指标如下：
++当前评测框架支持的评测数据集及评测指标如下；新增 MCQ 任务的 Atlas 全量精度和性能仍待验证：
+ 
+ | 评测数据集 | 注册名称 | 评测指标 | 说明 |
+ | :--- | :--- | :--- | :--- |
+ | VQA v2.0 验证集 | `vqa2_val` | `overall`、`answer_type`、`question_type` | 按 VQA v2.0 官方计分规则统计整体准确率，并分别按答案类型和问题类型汇总。 |
++| MMStar | `mmstar` | `overall`、`correct`、`total`、`invalid_predictions`、可用分类准确率 | VLMEval TSV 图像多选题，结构化答案抽取后精确匹配；Atlas 验收待完成。 |
++| RealWorldQA | `realworldqa` | 同上 | 与 MMStar 共用数据集/评测器，不依赖 VLMEvalKit 运行时；Atlas 验收待完成。 |
++
++Qwen3.5-9B 可直接使用仓库中的配置和启动入口（先修改权重、数据和 CANN 路径）：
++
++```bash
++bash examples/qwen3_5/evaluate_qwen3_5_9B.sh mmstar
++bash examples/qwen3_5/evaluate_qwen3_5_9B.sh realworldqa
++```
++
++详见[模型评测开发实践](../../features/qwen3_5_mcq_evaluation_practice.md)和
++[性能优化实践](../../features/qwen3_5_evaluation_performance_practice.md)。
++这两个 MCQ 任务显式启用 `replicated_inputs`，所有 FSDP rank 按相同顺序处理相同样本，
++不能按 rank 切分数据；仅 rank 0 评分写盘。原有 `vqa2_val` 分发和评分方式保持不变。
+ 
+ 如需新增评测数据集和评测指标方式，可按照下文适配流程进行添加。
+ 
+diff --git a/docs/zh/guides/development/inference_guide.md b/docs/zh/guides/development/inference_guide.md
+index 50c9659..d0ab612 100644
+--- a/docs/zh/guides/development/inference_guide.md
++++ b/docs/zh/guides/development/inference_guide.md
+@@ -151,7 +151,16 @@ bash examples/qwen3_5/qwen3_5_moe_inference.sh
+ 
+ ### 输出
+ 
+-rank 0 会打印每个样本的输入/输出 token 数、生成耗时、token/s 和解码文本，任务结束后会统计样本总数、总生成耗时和平均生成速率。推理成功的输出示例如下：
++rank 0 会打印每个样本的输入/输出 token 数、生成耗时、token/s 和解码文本。
++`generate` 前后通过统一 `synchronize()` 同步 NPU/CUDA，使用 `perf_counter()` 计时，避免异步执行低估耗时。
++任务结束后以 `sum(output_token_count) / sum(inference_duration)` 计算整体 `Decode throughput`，
++不对单样本速度取算术平均，也不乘 FSDP world size。该名称沿用评测口径，窗口包含 generate 内的
++prefill 和 decode，不是排除 prefill 的纯 decode 速度。
++
++另保留 `Overall inference speed`（输出 token / 推理循环墙钟耗时），用于区分包含预处理、解码等开销的速度。
++两者均不等于进程启动到指标落盘的端到端速度。原按 rank 分发模式下，Decode throughput
++是按各请求 generate 耗时加权的速度，并非并发墙钟吞吐。
++以下只展示字段和计算示例，不是新 MCQ 任务的 Atlas 实测：
+ 
+ ```text
+ Inference:   0%|          | 0/3 [00:00<?, ?sample/s]
+@@ -183,12 +192,16 @@ Inference result: 视频展示了一个充满活力的海洋生态系统，其
+ Inference: 100%|██████████| 3/3 [04:07<00:00, 82.45s/sample]
+ ===== Inference Summary =====
+ Total processed samples: 3
+-Total inference duration: 233.3613 seconds
+-Average inference speed: 1.77 tokens/second
++Total generate duration: 233.3614 seconds
++Decode throughput: 1.89 tokens/second
+ ```
+ 
+ ## 适配范围
+ 
++`generation` 另外支持 `min_p`（仅采样启用时传入）与 `presence_penalty`（默认 `null`，旧配置不启用）。
++后者只对 response 中出现过的 token 各减一次固定值，prompt 不参与，每次 generate 创建独立处理器。
++Qwen3.5 官方 thinking 口径的完整配置见[评测开发实践](../../features/qwen3_5_mcq_evaluation_practice.md)。
++
+ 当前推理框架支持 FSDP2 后端的多模态理解模型，已适配和验证的模型列表如下：
+ 
+ | 后端 | 模型 | 输入数据类型 | 权重格式 |
+diff --git a/examples/qwen3_5/README.md b/examples/qwen3_5/README.md
+index 665fcde..207b16e 100644
+--- a/examples/qwen3_5/README.md
++++ b/examples/qwen3_5/README.md
+@@ -24,10 +24,32 @@
+   - [启动微调](#3-启动微调)
+   - [LoRA 微调](#4-lora-微调)
+ - [环境变量声明](#环境变量声明)
++- [多模态选择题评测](#多模态选择题评测)
+ - [注意事项](#注意事项)
+ 
++## 多模态选择题评测
++
++支持以 MindSpeed-MM 原生 FSDP2 推理评测 MMStar 和 RealWorldQA，无需安装 VLMEvalKit。
++先按本 README 安装环境和配套扩展，准备 TSV，并修改
++`qwen3_5_9B_evaluation_mmstar.yaml` / `qwen3_5_9B_evaluation_realworldqa.yaml` 中的模型和数据路径。
++默认使用 9B thinking 参数、eager GDN/causal conv1d 精度基线及每节点 8 卡：
++
++```bash
++bash examples/qwen3_5/evaluate_qwen3_5_9B.sh mmstar
++bash examples/qwen3_5/evaluate_qwen3_5_9B.sh realworldqa
++```
++
++可用 `CANN_ENV_SCRIPT` 指定实际 CANN 环境脚本，分布式启动参数可由环境变量覆盖。
++先设置 `evaluation.max_samples: 10` 做冒烟，再恢复 `null` 运行全量。
++所有 rank 处理相同样本，仅 rank 0 写出预测与指标，吞吐不乘卡数。
++Atlas 精度、性能实测均待目标机验证。
++
++- [评测开发实践：数据、评分、验收和 27B/MoE 迁移](../../docs/zh/features/qwen3_5_mcq_evaluation_practice.md)
++- [性能优化实践：指标、显存和 A/B 顺序](../../docs/zh/features/qwen3_5_evaluation_performance_practice.md)
++
+ ## 版本说明
+ 
++
+ ### 参考实现
+ 
+ ```shell
+diff --git a/examples/qwen3_5/evaluate_qwen3_5_9B.sh b/examples/qwen3_5/evaluate_qwen3_5_9B.sh
+new file mode 100755
+index 0000000..c2122ec
+--- /dev/null
++++ b/examples/qwen3_5/evaluate_qwen3_5_9B.sh
+@@ -0,0 +1,47 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++if [[ $# -ne 1 || ( "$1" != "mmstar" && "$1" != "realworldqa" ) ]]; then
++    echo "Usage: $0 {mmstar|realworldqa}" >&2
++    exit 2
++fi
++dataset="$1"
++script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
++cd -- "${script_dir}/../.."
++
++# Override this with the actual CANN installation's set_env.sh when needed.
++CANN_ENV_SCRIPT="${CANN_ENV_SCRIPT:-/usr/local/Ascend/cann/set_env.sh}"
++if [[ ! -r "$CANN_ENV_SCRIPT" ]]; then
++    echo "CANN environment script is not readable: $CANN_ENV_SCRIPT" >&2
++    exit 1
++fi
++# CANN's vendor script may read unset variables; restore strict mode afterwards.
++set +u
++source "$CANN_ENV_SCRIPT"
++set -euo pipefail
++
++export NON_MEGATRON=true
++export MULTI_STREAM_MEMORY_REUSE=2
++export TASK_QUEUE_ENABLE=2
++export ASCEND_LAUNCH_BLOCKING=0
++export ACLNN_CACHE_LIMIT=100000
++export CPU_AFFINITY_CONF=1
++export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
++
++NPUS_PER_NODE="${NPUS_PER_NODE:-8}"
++MASTER_ADDR="${MASTER_ADDR:-localhost}"
++MASTER_PORT="${MASTER_PORT:-6000}"
++NNODES="${NNODES:-1}"
++NODE_RANK="${NODE_RANK:-0}"
++distributed_args=(
++    --nproc_per_node "$NPUS_PER_NODE"
++    --nnodes "$NNODES"
++    --node_rank "$NODE_RANK"
++    --master_addr "$MASTER_ADDR"
++    --master_port "$MASTER_PORT"
++)
++config_path="examples/qwen3_5/qwen3_5_9B_evaluation_${dataset}.yaml"
++timestamp=$(date +%Y%m%d_%H%M%S)
++mkdir -p logs
++torchrun "${distributed_args[@]}" mindspeed_mm/fsdp/evaluation/evaluation_runner.py \
++    "$config_path" 2>&1 | tee "logs/eval_${dataset}_${timestamp}_node${NODE_RANK}.log"
+diff --git a/examples/qwen3_5/qwen3_5_9B_evaluation_mmstar.yaml b/examples/qwen3_5/qwen3_5_9B_evaluation_mmstar.yaml
+new file mode 100644
+index 0000000..9129fa0
+--- /dev/null
++++ b/examples/qwen3_5/qwen3_5_9B_evaluation_mmstar.yaml
+@@ -0,0 +1,58 @@
++parallel:
++  fully_shard_parallel_size: auto
++  fsdp_plan:
++    apply_modules:
++      - model.visual
++      - model.visual.blocks.{*}
++      - model.language_model.embed_tokens
++      - model.language_model
++      - model.language_model.layers.{*}
++      - model.language_model.layers.{*}.linear_attn
++      - lm_head
++      - mtp
++    hook_modules:
++      - model.language_model.layers.{*}
++    param_dtype: bf16
++    reduce_dtype: fp32
++    reshard_after_forward: true
++    num_to_forward_prefetch: 1
++    num_to_backward_prefetch: 0
++    cpu_offload: false
++  ulysses_parallel_size: 1
++  expert_parallel_size: 1
++
++model:
++  model_id: qwen3_5
++  model_name_or_path: &HF_MODEL_LOAD_PATH /path/to/Qwen3.5-9B
++  trust_remote_code: true
++  attn_implementation: flash_attention_2
++  gdn_implementation: eager
++  causal_conv1d_implementation: eager
++
++inference:
++  load: *HF_MODEL_LOAD_PATH
++  load_format: auto
++  init_model_with_meta_device: true
++  seed: 42
++  use_deter_comp: false
++  adapter: qwen3_5
++  processor_path: *HF_MODEL_LOAD_PATH
++  enable_thinking: true
++  generation:
++    max_new_tokens: 32768
++    do_sample: true
++    temperature: 1.0
++    top_p: 0.95
++    top_k: 20
++    min_p: 0.0
++    presence_penalty: 1.5
++    repetition_penalty: 1.0
++    use_cache: true
++  plugin:
++    - mindspeed_mm/fsdp/models/qwen3_5
++
++evaluation:
++  dataset_type: mmstar
++  dataset_path: ./data/MMStar.tsv
++  max_samples: null
++  result_output_path: ./evaluation_outputs
+diff --git a/examples/qwen3_5/qwen3_5_9B_evaluation_realworldqa.yaml b/examples/qwen3_5/qwen3_5_9B_evaluation_realworldqa.yaml
+new file mode 100644
+index 0000000..5bf3e66
+--- /dev/null
++++ b/examples/qwen3_5/qwen3_5_9B_evaluation_realworldqa.yaml
+@@ -0,0 +1,58 @@
++parallel:
++  fully_shard_parallel_size: auto
++  fsdp_plan:
++    apply_modules:
++      - model.visual
++      - model.visual.blocks.{*}
++      - model.language_model.embed_tokens
++      - model.language_model
++      - model.language_model.layers.{*}
++      - model.language_model.layers.{*}.linear_attn
++      - lm_head
++      - mtp
++    hook_modules:
++      - model.language_model.layers.{*}
++    param_dtype: bf16
++    reduce_dtype: fp32
++    reshard_after_forward: true
++    num_to_forward_prefetch: 1
++    num_to_backward_prefetch: 0
++    cpu_offload: false
++  ulysses_parallel_size: 1
++  expert_parallel_size: 1
++
++model:
++  model_id: qwen3_5
++  model_name_or_path: &HF_MODEL_LOAD_PATH /path/to/Qwen3.5-9B
++  trust_remote_code: true
++  attn_implementation: flash_attention_2
++  gdn_implementation: eager
++  causal_conv1d_implementation: eager
++
++inference:
++  load: *HF_MODEL_LOAD_PATH
++  load_format: auto
++  init_model_with_meta_device: true
++  seed: 42
++  use_deter_comp: false
++  adapter: qwen3_5
++  processor_path: *HF_MODEL_LOAD_PATH
++  enable_thinking: true
++  generation:
++    max_new_tokens: 32768
++    do_sample: true
++    temperature: 1.0
++    top_p: 0.95
++    top_k: 20
++    min_p: 0.0
++    presence_penalty: 1.5
++    repetition_penalty: 1.0
++    use_cache: true
++  plugin:
++    - mindspeed_mm/fsdp/models/qwen3_5
++
++evaluation:
++  dataset_type: realworldqa
++  dataset_path: ./data/RealWorldQA.tsv
++  max_samples: null
++  result_output_path: ./evaluation_outputs
+diff --git a/mindspeed_mm/fsdp/evaluation/eval_datasets/__init__.py b/mindspeed_mm/fsdp/evaluation/eval_datasets/__init__.py
+index 654442b..988865a 100644
+--- a/mindspeed_mm/fsdp/evaluation/eval_datasets/__init__.py
++++ b/mindspeed_mm/fsdp/evaluation/eval_datasets/__init__.py
+@@ -1,6 +1,11 @@
++from functools import partial
++
++from .vlmeval_mcq_dataset import VLMEvalMCQDataset
+ from .vqa2_dataset import VQA2ValDataset
+ 
+ 
+ eval_dataset_dict = {
+     "vqa2_val": VQA2ValDataset,
++    "mmstar": partial(VLMEvalMCQDataset, dataset_name="MMStar"),
++    "realworldqa": partial(VLMEvalMCQDataset, dataset_name="RealWorldQA"),
+ }
+diff --git a/mindspeed_mm/fsdp/evaluation/eval_datasets/vlmeval_mcq_dataset.py b/mindspeed_mm/fsdp/evaluation/eval_datasets/vlmeval_mcq_dataset.py
+new file mode 100644
+index 0000000..0b55e31
+--- /dev/null
++++ b/mindspeed_mm/fsdp/evaluation/eval_datasets/vlmeval_mcq_dataset.py
+@@ -0,0 +1,167 @@
++"""VLMEval-compatible image MCQ TSVs, without a VLMEvalKit dependency."""
++
++import base64
++import binascii
++import errno
++import hashlib
++import os
++import string
++import tempfile
++from pathlib import Path
++from typing import Any, Iterator, Optional
++
++import pandas as pd
++
++
++class VLMEvalMCQDataset:
++    REQUIRED_COLUMNS = {"index", "image", "question", "answer", "A", "B"}
++    PROMPT_SUFFIX = (
++        "Please select the correct answer from the options above. "
++        "Please show your choice in the `answer` field with only the choice letter, "
++        'e.g., `"answer": "C"`.'
++    )
++
++    def __init__(
++        self,
++        dataset_path: str | Path,
++        dataset_name: str,
++        max_samples: Optional[int] = None,
++    ) -> None:
++        if max_samples is not None and max_samples < 0:
++            raise ValueError("max_samples must be non-negative or None")
++        if not dataset_name or Path(dataset_name).name != dataset_name or dataset_name in {".", ".."}:
++            raise ValueError("dataset_name must be a single directory name")
++        path = Path(dataset_path).expanduser()
++        self.path = (path / f"{dataset_name}.tsv" if path.is_dir() else path).resolve()
++        # Preserve leading-zero IDs and literal answers such as 'NA'. Only empty
++        # strings are missing; pandas' default NA inference changes MCQ content.
++        frame = pd.read_csv(self.path, sep="\t", dtype=str, keep_default_na=False)
++        missing = self.REQUIRED_COLUMNS - set(frame.columns)
++        if missing:
++            raise ValueError(f"{self.path}: missing required TSV columns: {', '.join(sorted(missing))}")
++        frame["index"] = frame["index"].str.strip()
++        if (frame["index"] == "").any():
++            raise ValueError(f"{self.path}: sample index must not be empty")
++        duplicate = frame.loc[frame["index"].duplicated(), "index"].tolist()
++        if duplicate:
++            raise ValueError(f"{self.path}: duplicate sample index: {duplicate[0]!r}")
++        # References may point outside max_samples. Index the entire input first.
++        self._image_by_id = dict(zip(frame["index"], frame["image"].str.strip()))
++        self._rows = (
++            frame.iloc[:max_samples].to_dict("records") if max_samples is not None else frame.to_dict("records")
++        )
++        self.cache_dir = self.path.parent / ".mindspeed_mm_cache" / dataset_name / "images"
++        self._resolved_images: dict[str, str] = {}
++
++    def __len__(self) -> int:
++        return len(self._rows)
++
++    def __iter__(self) -> Iterator[dict[str, Any]]:
++        for index in range(len(self)):
++            yield self[index]
++
++    def __getitem__(self, index: int) -> dict[str, Any]:
++        row = self._rows[index]
++        sample_id = row["index"]
++        choices = {key: row[key].strip() for key in string.ascii_uppercase if row.get(key, "").strip()}
++        if not {"A", "B"}.issubset(choices):
++            raise ValueError(f"Sample {sample_id}: options A and B must not be empty")
++        answer = row["answer"].strip().upper()
++        if answer not in choices:
++            raise ValueError(f"Sample {sample_id}: answer {answer!r} is not in choices {list(choices)}")
++        question = row["question"].strip()
++        if not question:
++            raise ValueError(f"Sample {sample_id}: question must not be empty")
++        options = "\n".join(f"{key}. {value}" for key, value in choices.items())
++        item = {
++            "sample_id": sample_id,
++            "image": self._resolve_image(row["image"].strip(), sample_id),
++            "text": f"Question: {question}\nOptions:\n{options}\n{self.PROMPT_SUFFIX}",
++            "question": question,
++            "choices": choices,
++            "answer": answer,
++        }
++        for key in ("category", "l2_category", "bench"):
++            value = row.get(key, "").strip()
++            if key == "l2_category" and not value:
++                value = row.get("l2-category", "").strip()
++            if value:
++                item[key] = value
++        return item
++
++    @staticmethod
++    def _image_suffix(header: bytes) -> str:
++        if header.startswith(b"\x89PNG\r\n\x1a\n"):
++            return ".png"
++        if header.startswith(b"\xff\xd8\xff"):
++            return ".jpg"
++        if header.startswith((b"GIF87a", b"GIF89a")):
++            return ".gif"
++        if header.startswith(b"RIFF") and header[8:12] == b"WEBP":
++            return ".webp"
++        raise ValueError("Unsupported image content: expected PNG, JPEG, GIF or WEBP magic bytes")
++
++    def _resolve_image(self, value: str, sample_id: str) -> str:
++        visited: set[str] = set()
++        while True:
++            if not value:
++                raise ValueError(f"Sample {sample_id}: image must not be empty")
++            if value in visited:
++                raise ValueError(f"Sample {sample_id}: cyclic image reference at {value!r}")
++            visited.add(value)
++            if value in self._resolved_images:
++                return self._resolved_images[value]
++            # A real filename takes precedence over an identically named ID.
++            path = Path(value).expanduser()
++            if not path.is_absolute():
++                path = self.path.parent / path
++            try:
++                is_file = path.is_file()
++            except OSError as error:
++                if error.errno != errno.ENAMETOOLONG:
++                    raise
++                is_file = False
++            if is_file:
++                with path.open("rb") as file:
++                    self._image_suffix(file.read(12))
++                resolved = str(path.resolve())
++                break
++            if value in self._image_by_id:
++                value = self._image_by_id[value]
++                continue
++            encoded = value
++            if encoded.startswith("data:image/"):
++                prefix, separator, encoded = encoded.partition(",")
++                if not separator or not prefix.endswith(";base64"):
++                    raise ValueError(f"Sample {sample_id}: expected a base64 image data URI")
++            try:
++                content = base64.b64decode("".join(encoded.split()), validate=True)
++            except (binascii.Error, ValueError) as error:
++                raise ValueError(
++                    f"Sample {sample_id}: image is neither a file, index reference nor valid base64"
++                ) from error
++            suffix = self._image_suffix(content)
++            resolved = str(self._cache_image(content, suffix))
++            break
++        for source in visited:
++            self._resolved_images[source] = resolved
++        return resolved
++
++    def _cache_image(self, content: bytes, suffix: str) -> Path:
++        digest = hashlib.sha256(content).hexdigest()[:24]
++        target = self.cache_dir / f"{digest}{suffix}"
++        self.cache_dir.mkdir(parents=True, exist_ok=True)
++        if target.is_file() and target.stat().st_size == len(content):
++            return target
++        # Every rank may decode concurrently. Publish only complete files.
++        fd, temporary = tempfile.mkstemp(prefix=f".{digest}-", dir=self.cache_dir)
++        try:
++            with os.fdopen(fd, "wb") as file:
++                file.write(content)
++                file.flush()
++                os.fsync(file.fileno())
++            os.replace(temporary, target)
++        finally:
++            if os.path.exists(temporary):
++                os.unlink(temporary)
++        return target
+diff --git a/mindspeed_mm/fsdp/evaluation/eval_impl/__init__.py b/mindspeed_mm/fsdp/evaluation/eval_impl/__init__.py
+index e7d444e..c49f469 100644
+--- a/mindspeed_mm/fsdp/evaluation/eval_impl/__init__.py
++++ b/mindspeed_mm/fsdp/evaluation/eval_impl/__init__.py
+@@ -1,6 +1,9 @@
++from .impl_vlmeval_mcq import VLMEvalMCQEvaluator
+ from .impl_vqa2val import VQA2Evaluator
+ 
+ 
+ eval_impl_dict = {
+     "vqa2_val": VQA2Evaluator,
++    "mmstar": VLMEvalMCQEvaluator,
++    "realworldqa": VLMEvalMCQEvaluator,
+ }
+diff --git a/mindspeed_mm/fsdp/evaluation/eval_impl/impl_vlmeval_mcq.py b/mindspeed_mm/fsdp/evaluation/eval_impl/impl_vlmeval_mcq.py
+new file mode 100644
+index 0000000..43e7562
+--- /dev/null
++++ b/mindspeed_mm/fsdp/evaluation/eval_impl/impl_vlmeval_mcq.py
+@@ -0,0 +1,108 @@
++"""Deterministic image MCQ scoring; no judge model or VLMEvalKit runtime."""
++
++import json
++import re
++from collections import defaultdict
++from pathlib import Path
++from typing import Any
++
++from .impl_base import BaseEvaluator
++
++
++def extract_choice(prediction: str, choices: dict[str, str]) -> str | None:
++    """Extract an unambiguous final choice, ignoring the reasoning prefix."""
++    answer = prediction.rsplit("</think>", 1)[-1].strip()
++    if not answer or not choices:
++        return None
++    patterns = (
++        r"""(?i)["']answer["']\s*:\s*["']([a-z])["']""",
++        r"(?i:\b(?:(?:the\s+)?(?:correct|final)\s+)?answer\s*(?:is\s*:?|:)\s*" r"(?:option\s+)?)[*_`\s\(\[]*([A-Z])\b",
++        r"\\boxed\{\s*([a-zA-Z])\s*\}",
++    )
++    for pattern in patterns:
++        occurrences = list(re.finditer(pattern, answer))
++        # An explicit prefix does not make 'answer is A or B' unambiguous.
++        for occurrence in occurrences:
++            if re.match(
++                r"""[*_`'"\s\)\]]*(?:or\b|and\b|/)\s*(?:option\s+)?[*_`\s\(\[]*[A-Z]\b""",
++                answer[occurrence.end() :],
++                flags=re.IGNORECASE,
++            ):
++                return None
++        matches = {match.group(1).upper() for match in occurrences}
++        if matches:
++            return next(iter(matches)) if len(matches) == 1 and matches.issubset(choices) else None
++
++    # Do not uppercase prose: the English article 'a' is not an option label.
++    tokens = re.findall(r"\w+", answer)
++    candidates = {token for token in tokens if token in choices}
++    if len(candidates) == 1:
++        choice = next(iter(candidates))
++        if choice in tokens[-5:]:
++            return choice
++    if len(candidates) > 1:
++        return None
++
++    if len(answer) <= 2 * sum(len(text) for text in choices.values()):
++        normalized = answer.casefold()
++        matches = {
++            key
++            for key, text in choices.items()
++            if text.strip() and re.search(r"(?<!\w)" + re.escape(text.strip().casefold()) + r"(?!\w)", normalized)
++        }
++        if len(matches) == 1:
++            return next(iter(matches))
++    return None
++
++
++class VLMEvalMCQEvaluator(BaseEvaluator):
++    def __init__(self, result_output_path: str, model_name: str, dataset_name: str) -> None:
++        self.result_output_path = Path(result_output_path)
++        self.result_prefix = f"{model_name}_{dataset_name}"
++        self.predictions: list[dict[str, Any]] = []
++
++    def update(self, item: dict[str, Any], prediction: str) -> None:
++        choice = extract_choice(prediction, item["choices"])
++        record = {
++            "sample_id": item["sample_id"],
++            "question": item["question"],
++            "choices": item["choices"],
++            "answer": item["answer"],
++            "prediction": prediction,
++            "extracted_choice": choice,
++            "hit": int(choice == item["answer"]),
++        }
++        for key in ("category", "l2_category", "bench"):
++            if key in item:
++                record[key] = item[key]
++        self.predictions.append(record)
++
++    @staticmethod
++    def _accuracy(hits: list[int]) -> float:
++        return round(100 * sum(hits) / len(hits), 2) if hits else 0.0
++
++    def compute(self) -> dict[str, Any]:
++        hits = [record["hit"] for record in self.predictions]
++        metrics = {
++            "overall": self._accuracy(hits),
++            "correct": sum(hits),
++            "total": len(hits),
++            "invalid_predictions": sum(record["extracted_choice"] is None for record in self.predictions),
++        }
++        for key in ("category", "l2_category", "bench"):
++            groups = defaultdict(list)
++            for record in self.predictions:
++                if key in record:
++                    groups[record[key]].append(record["hit"])
++            if groups:
++                metrics[key] = {name: self._accuracy(scores) for name, scores in sorted(groups.items())}
++        return metrics
++
++    def finalize(self) -> dict[str, Any]:
++        metrics = self.compute()
++        self.result_output_path.mkdir(parents=True, exist_ok=True)
++        for suffix, value in (("predictions", self.predictions), ("metrics", metrics)):
++            path = self.result_output_path / f"{self.result_prefix}_{suffix}.json"
++            with path.open("w", encoding="utf-8") as file:
++                json.dump(value, file, ensure_ascii=False, indent=2)
++        return metrics
+diff --git a/mindspeed_mm/fsdp/evaluation/evaluation_runner.py b/mindspeed_mm/fsdp/evaluation/evaluation_runner.py
+index e2f0057..1ffa74c 100644
+--- a/mindspeed_mm/fsdp/evaluation/evaluation_runner.py
++++ b/mindspeed_mm/fsdp/evaluation/evaluation_runner.py
+@@ -19,6 +19,7 @@ class EvaluationRunner:
+         self.inference_runner = InferenceRunner(
+             args=args,
+             data_provider=self.data_provider,
++            replicated_inputs=args.evaluation.dataset_type in {"mmstar", "realworldqa"},
+         )
+         evaluator = eval_impl_dict[args.evaluation.dataset_type]
+         self.evaluator = evaluator(
+diff --git a/mindspeed_mm/fsdp/inference/infer_engine.py b/mindspeed_mm/fsdp/inference/infer_engine.py
+index a8d0fdf..fc06dfa 100644
+--- a/mindspeed_mm/fsdp/inference/infer_engine.py
++++ b/mindspeed_mm/fsdp/inference/infer_engine.py
+@@ -7,15 +7,18 @@ from tqdm import tqdm
+ 
+ from mindspeed.fsdp.utils.log import print_rank
+ 
++from mindspeed_mm.fsdp.utils.device import synchronize
++
+ 
+ class InferEngine:
+     """Executes preprocessing, generation, and decoding."""
+ 
+-    def __init__(self, args, adapter, inference_dataloader, total_samples: int):
++    def __init__(self, args, adapter, inference_dataloader, total_samples: int, replicated_inputs: bool = False):
+         self.args = args
+         self.adapter = adapter
+         self.inference_dataloader = inference_dataloader
+         self.total_samples = total_samples
++        self.replicated_inputs = replicated_inputs
+ 
+     def infer(
+         self,
+@@ -33,7 +36,7 @@ class InferEngine:
+         total_started = time.perf_counter()
+ 
+         for step_index, item in enumerate(self.inference_dataloader):
+-            global_index = step_index * world_size + global_rank
++            global_index = step_index if self.replicated_inputs else step_index * world_size + global_rank
+             is_padding = global_index >= self.total_samples
+             global_index = 0 if is_padding else global_index
+             messages = sample_builder(item, global_index)
+@@ -41,11 +44,13 @@ class InferEngine:
+             input_token_count = int(inputs["input_ids"].shape[-1])
+ 
+             with torch.inference_mode():
++                synchronize()
+                 started = time.perf_counter()
+                 outputs = self.adapter.generate(inputs, self.args.inference.generation)
++                synchronize()
+                 inference_duration = time.perf_counter() - started
+ 
+-            result = None if is_padding else (
++            result = None if is_padding or (self.replicated_inputs and global_rank != 0) else (
+                 item,
+                 {
+                     "input_token_count": input_token_count,
+@@ -56,7 +61,11 @@ class InferEngine:
+                 },
+             )
+ 
+-            batch_results = self.gather_batch_results(result)
++            if self.replicated_inputs:
++                # Count each shared response once, and only decode/store on rank 0.
++                batch_results = [result] if result is not None else []
++            else:
++                batch_results = self.gather_batch_results(result)
+             inference_results.extend(batch_results)
+             progress.update(len(batch_results))
+             print_rank(print, f"===== Inference Batch {step_index + 1} =====")
+@@ -68,14 +77,19 @@ class InferEngine:
+ 
+         total_input_tokens = sum(result["input_token_count"] for _, result in inference_results)
+         total_output_tokens = sum(result["output_token_count"] for _, result in inference_results)
++        total_generation_duration = sum(result["inference_duration"] for _, result in inference_results)
++        decode_throughput = total_output_tokens / total_generation_duration if total_generation_duration else 0.0
+ 
+         print_rank(print, "===== Inference Summary =====")
+         print_rank(print, f"Total processed samples: {len(inference_results)}")
+         print_rank(print, f"Inference rounds: {len(self.inference_dataloader)}")
+         print_rank(print, f"Total input tokens: {total_input_tokens}")
+         print_rank(print, f"Total output tokens: {total_output_tokens}")
++        print_rank(print, f"Total generate duration: {total_generation_duration:.4f} seconds")
++        print_rank(print, f"Decode throughput: {decode_throughput:.2f} tokens/second")
+         print_rank(print, f"Total inference duration: {total_duration:.4f} seconds")
+-        print_rank(print, f"Overall inference speed: {total_output_tokens / total_duration:.2f} tokens/second")
++        overall_speed = total_output_tokens / total_duration if total_duration else 0.0
++        print_rank(print, f"Overall inference speed: {overall_speed:.2f} tokens/second")
+ 
+         return inference_results
+ 
+@@ -90,7 +104,8 @@ class InferEngine:
+         return sorted(batch_results, key=lambda pair: pair[1]["global_index"])
+ 
+     def infering_log(self, item: dict, result: dict) -> None:
+-        inference_speed = result["output_token_count"] / result["inference_duration"]
++        duration = result["inference_duration"]
++        inference_speed = result["output_token_count"] / duration if duration else 0.0
+ 
+         print_rank(print, f"----- Sample {result['global_index'] + 1} -----")
+         if "image" in item:
+diff --git a/mindspeed_mm/fsdp/inference/inference_runner.py b/mindspeed_mm/fsdp/inference/inference_runner.py
+index 16e76f6..c35922b 100644
+--- a/mindspeed_mm/fsdp/inference/inference_runner.py
++++ b/mindspeed_mm/fsdp/inference/inference_runner.py
+@@ -44,19 +44,22 @@ class InferenceRunner:
+         self,
+         args: InferenceArguments,
+         data_provider: Optional[Callable] = None,
++        replicated_inputs: bool = False,
+     ):
+         self.args = args
+         self.data_provider = data_provider
++        self.replicated_inputs = replicated_inputs
+         self.initialize()
+         self.model = self.get_model()
+         self.adapter = self.get_adapter()
+         self.inference_data = self.get_data()
+-        self.inference_dataloader = self.get_dataloader(self.inference_data)
++        self.inference_dataloader = self.get_dataloader(self.inference_data, replicated_inputs=replicated_inputs)
+         self.engine = InferEngine(
+             args,
+             self.adapter,
+             self.inference_dataloader,
+             len(self.inference_data),
++            replicated_inputs=replicated_inputs,
+         )
+ 
+     def initialize(self) -> None:
+@@ -171,7 +174,11 @@ class InferenceRunner:
+         return data
+ 
+     @staticmethod
+-    def get_dataloader(inference_data: Sequence[dict]) -> StatefulDataLoader:
++    def get_dataloader(inference_data: Sequence[dict], replicated_inputs: bool = False) -> StatefulDataLoader:
++        if replicated_inputs:
++            # A single sharded model processes one shared sample on all ranks.
++            # No DistributedSampler: padding and rank partitioning are unwanted.
++            return StatefulDataLoader(inference_data, batch_size=None, shuffle=False, num_workers=0)
+         sampler = StatefulDistributedSampler(
+             inference_data,
+             num_replicas=dist.get_world_size(),
+diff --git a/mindspeed_mm/fsdp/inference/logits_processors.py b/mindspeed_mm/fsdp/inference/logits_processors.py
+new file mode 100644
+index 0000000..04dec94
+--- /dev/null
++++ b/mindspeed_mm/fsdp/inference/logits_processors.py
+@@ -0,0 +1,29 @@
++"""Response-only logits penalties for Hugging Face generation."""
++
++import math
++
++import torch
++from transformers import LogitsProcessor
++
++
++class PresencePenaltyLogitsProcessor(LogitsProcessor):
++    """Subtract a fixed penalty once per seen response token, not prompt token.
++
++    Create a fresh instance for every generate call: prompt_length is stateful.
++    """
++
++    def __init__(self, penalty: float) -> None:
++        if not math.isfinite(penalty):
++            raise ValueError("presence penalty must be finite")
++        self.penalty = penalty
++        self.prompt_length: int | None = None
++
++    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
++        if self.prompt_length is None:
++            self.prompt_length = input_ids.shape[-1]
++        generated = input_ids[:, self.prompt_length :]
++        if self.penalty == 0 or generated.shape[-1] == 0:
++            return scores
++        seen = torch.zeros_like(scores, dtype=torch.bool)
++        seen.scatter_(dim=1, index=generated, value=True)
++        return scores - seen.to(scores.dtype) * self.penalty
+diff --git a/mindspeed_mm/fsdp/params/inference_args.py b/mindspeed_mm/fsdp/params/inference_args.py
+index cb28d5f..5a04f08 100644
+--- a/mindspeed_mm/fsdp/params/inference_args.py
++++ b/mindspeed_mm/fsdp/params/inference_args.py
+@@ -29,6 +29,14 @@ class GenerationArguments(BaseArguments):
+         default=None,
+         metadata={"help": "Number of highest-probability tokens to sample from. Only used when do_sample is enabled."},
+     )
++    min_p: Optional[float] = field(
++        default=None,
++        metadata={"help": "Minimum probability relative to the most likely token; used only when sampling."},
++    )
++    presence_penalty: Optional[float] = field(
++        default=None,
++        metadata={"help": "Fixed additive penalty for tokens seen in the response, excluding the prompt."},
++    )
+     repetition_penalty: float = field(
+         default=1.0,
+         metadata={"help": "Penalty applied to repeated tokens during generation. Default to 1.0."},
+@@ -48,10 +56,14 @@ class GenerationArguments(BaseArguments):
+         if distributed:
+             kwargs["synced_gpus"] = True
+         if self.do_sample:
+-            for key in ("temperature", "top_p", "top_k"):
++            for key in ("temperature", "top_p", "top_k", "min_p"):
+                 value = getattr(self, key)
+                 if value is not None:
+                     kwargs[key] = value
++        if self.presence_penalty is not None and self.presence_penalty != 0:
++            from mindspeed_mm.fsdp.inference.logits_processors import PresencePenaltyLogitsProcessor
++
++            kwargs["logits_processor"] = [PresencePenaltyLogitsProcessor(self.presence_penalty)]
+         return kwargs
+ 
+ 
+diff --git a/tests/ut_fsdp/evaluation/test_qwen3_5_eval_config.py b/tests/ut_fsdp/evaluation/test_qwen3_5_eval_config.py
+new file mode 100644
+index 0000000..0280119
+--- /dev/null
++++ b/tests/ut_fsdp/evaluation/test_qwen3_5_eval_config.py
+@@ -0,0 +1,89 @@
++"""Validate example configuration and launcher without invoking torchrun."""
++
++import os
++import shutil
++import subprocess
++from pathlib import Path
++
++import pytest
++import yaml
++
++os.environ.setdefault("NON_MEGATRON", "true")
++
++from mindspeed_mm.fsdp.params.evaluation_args import EvaluationArguments
++
++REPO = Path(__file__).resolve().parents[3]
++EXAMPLES = REPO / "examples/qwen3_5"
++
++
++def test_official_configs_match_and_parse(monkeypatch):
++    for key, value in {"LOCAL_RANK": "0", "RANK": "0", "WORLD_SIZE": "8"}.items():
++        monkeypatch.setenv(key, value)
++    common = []
++    for dataset, filename in [("mmstar", "MMStar"), ("realworldqa", "RealWorldQA")]:
++        config = yaml.safe_load((EXAMPLES / f"qwen3_5_9B_evaluation_{dataset}.yaml").read_text())
++        args = EvaluationArguments(**config)
++        assert args.evaluation.dataset_type == dataset
++        assert args.evaluation.dataset_path == f"./data/{filename}.tsv"
++        assert args.evaluation.max_samples is None
++        assert args.parallel.fully_shard_parallel_size == 8
++        assert args.model.model_id == args.inference.adapter == "qwen3_5"
++        assert args.model.gdn_implementation == args.model.causal_conv1d_implementation == "eager"
++        assert args.inference.enable_thinking is True
++        assert args.inference.load == args.model.model_name_or_path == args.inference.processor_path
++        assert args.inference.generation.max_new_tokens == 32768
++        assert args.inference.generation.presence_penalty == 1.5
++        config.pop("evaluation")
++        common.append(config)
++    assert common[0] == common[1]
++
++
++@pytest.mark.parametrize("arguments", [[], ["vqa2_val"], ["MMStar"], ["mmstar", "extra"]])
++def test_invalid_launcher_arguments_exit_two(arguments):
++    result = subprocess.run(
++        ["bash", str(EXAMPLES / "evaluate_qwen3_5_9B.sh"), *arguments], capture_output=True, text=True
++    )
++    assert result.returncode == 2
++    assert "Usage:" in result.stderr
++
++
++@pytest.mark.parametrize("dataset", ["mmstar", "realworldqa"])
++@pytest.mark.parametrize("torchrun_exit", [0, 7])
++def test_launcher_overrides_and_propagates_failure(tmp_path, dataset, torchrun_exit):
++    example_dir = tmp_path / "examples/qwen3_5"
++    example_dir.mkdir(parents=True)
++    launcher = example_dir / "evaluate_qwen3_5_9B.sh"
++    shutil.copy2(EXAMPLES / launcher.name, launcher)
++    binary_dir = tmp_path / "bin"
++    binary_dir.mkdir()
++    fake_torchrun = binary_dir / "torchrun"
++    fake_torchrun.write_text('#!/usr/bin/env bash\nprintf "%s\\n" "$@"\nexit ' + str(torchrun_exit) + "\n")
++    fake_torchrun.chmod(0o755)
++    env = {
++        **os.environ,
++        "PATH": str(binary_dir) + os.pathsep + os.environ["PATH"],
++        "CANN_ENV_SCRIPT": "/dev/null",
++        "NPUS_PER_NODE": "2",
++        "MASTER_ADDR": "test-host",
++        "MASTER_PORT": "6123",
++        "NNODES": "3",
++        "NODE_RANK": "1",
++    }
++    result = subprocess.run(["bash", str(launcher), dataset], cwd=tmp_path, env=env, capture_output=True, text=True)
++    assert result.returncode == torchrun_exit
++    assert result.stdout.splitlines() == [
++        "--nproc_per_node",
++        "2",
++        "--nnodes",
++        "3",
++        "--node_rank",
++        "1",
++        "--master_addr",
++        "test-host",
++        "--master_port",
++        "6123",
++        "mindspeed_mm/fsdp/evaluation/evaluation_runner.py",
++        f"examples/qwen3_5/qwen3_5_9B_evaluation_{dataset}.yaml",
++    ]
++    logs = list((tmp_path / "logs").glob(f"eval_{dataset}_*_node1.log"))
++    assert len(logs) == 1 and logs[0].read_text() == result.stdout
+diff --git a/tests/ut_fsdp/evaluation/test_vlmeval_mcq.py b/tests/ut_fsdp/evaluation/test_vlmeval_mcq.py
+new file mode 100644
+index 0000000..7db108d
+--- /dev/null
++++ b/tests/ut_fsdp/evaluation/test_vlmeval_mcq.py
+@@ -0,0 +1,245 @@
++"""CPU logic tests; run with NON_MEGATRON=true in the FSDP environment."""
++
++import base64
++import hashlib
++import json
++import os
++from io import BytesIO
++from concurrent.futures import ThreadPoolExecutor
++from pathlib import Path
++
++import pandas as pd
++import pytest
++from PIL import Image
++
++os.environ.setdefault("NON_MEGATRON", "true")
++
++from mindspeed_mm.fsdp.evaluation.eval_datasets import eval_dataset_dict
++from mindspeed_mm.fsdp.evaluation.eval_datasets.vlmeval_mcq_dataset import VLMEvalMCQDataset
++from mindspeed_mm.fsdp.evaluation.eval_impl import eval_impl_dict
++from mindspeed_mm.fsdp.evaluation.eval_impl.impl_vlmeval_mcq import VLMEvalMCQEvaluator, extract_choice
++
++PNG_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII="
++PNG = base64.b64decode(PNG_BASE64)
++CHOICES = {"A": "red", "B": "blue", "C": "green", "D": "yellow"}
++
++
++def make_tsv(tmp_path, rows=None, name="MMStar.tsv"):
++    if rows is None:
++        rows = [{}]
++    records = []
++    for index, row in enumerate(rows):
++        records.append(
++            {"index": str(index), "image": PNG_BASE64, "question": "Which color?", "answer": "B", **CHOICES, **row}
++        )
++    path = tmp_path / name
++    pd.DataFrame(records).to_csv(path, sep="\t", index=False)
++    return path
++
++
++def test_image_reference_prompt_and_content_cache(tmp_path):
++    path = make_tsv(tmp_path, [{}, {"image": "0", "answer": "b", "l2-category": "color"}])
++    data = VLMEvalMCQDataset(path, "MMStar")
++    first, second = list(data)
++    image = Path(first["image"])
++    assert image.read_bytes() == PNG
++    with Image.open(BytesIO(image.read_bytes())) as decoded:
++        decoded.load()
++        assert decoded.size == (1, 1)
++    assert image.name == hashlib.sha256(PNG).hexdigest()[:24] + ".png"
++    assert first["image"] == second["image"]
++    assert second["answer"] == "B" and second["l2_category"] == "color"
++    assert first["sample_id"] == "0"
++    assert first["text"] == (
++        "Question: Which color?\nOptions:\nA. red\nB. blue\nC. green\nD. yellow\n" + VLMEvalMCQDataset.PROMPT_SUFFIX
++    )
++    timestamp = image.stat().st_mtime_ns
++    assert VLMEvalMCQDataset(path, "MMStar")[0]["image"] == str(image)
++    assert image.stat().st_mtime_ns == timestamp
++
++
++def test_reference_beyond_limit_and_multiple_hops(tmp_path):
++    path = make_tsv(tmp_path, [{"image": "1"}, {"image": "2"}, {}])
++    data = VLMEvalMCQDataset(tmp_path, "MMStar", max_samples=1)
++    assert len(data) == 1
++    assert Path(data[0]["image"]).read_bytes() == PNG
++    assert len(VLMEvalMCQDataset(path, "MMStar", max_samples=0)) == 0
++    with pytest.raises(ValueError, match="max_samples"):
++        VLMEvalMCQDataset(path, "MMStar", max_samples=-1)
++
++
++@pytest.mark.parametrize("rows", [[{"image": "1"}, {"image": "0"}], [{"image": "0"}]])
++def test_cyclic_reference(tmp_path, rows):
++    with pytest.raises(ValueError, match="cyclic"):
++        VLMEvalMCQDataset(make_tsv(tmp_path, rows), "MMStar")[0]
++
++
++@pytest.mark.parametrize("column", sorted(VLMEvalMCQDataset.REQUIRED_COLUMNS))
++def test_missing_column(tmp_path, column):
++    path = make_tsv(tmp_path)
++    frame = pd.read_csv(path, sep="\t").drop(columns=[column])
++    frame.to_csv(path, sep="\t", index=False)
++    with pytest.raises(ValueError, match=f"missing required TSV columns: {column}"):
++        VLMEvalMCQDataset(path, "MMStar")
++
++
++def test_duplicate_checked_before_truncation(tmp_path):
++    path = make_tsv(tmp_path, [{}, {"index": "0"}])
++    with pytest.raises(ValueError, match="duplicate sample index"):
++        VLMEvalMCQDataset(path, "MMStar", max_samples=1)
++
++
++@pytest.mark.parametrize(
++    "field,value,message",
++    [
++        ("index", "", "index must not be empty"),
++        ("image", "", "image must not be empty"),
++        ("question", " ", "question must not be empty"),
++        ("answer", "Z", "is not in choices"),
++        ("A", " ", "options A and B"),
++        ("image", "missing.png", "valid base64"),
++        ("image", base64.b64encode(b"not an image").decode(), "Unsupported image"),
++        ("image", "data:image/png,hello", "base64 image data URI"),
++    ],
++)
++def test_invalid_values(tmp_path, field, value, message):
++    with pytest.raises(ValueError, match=message):
++        VLMEvalMCQDataset(make_tsv(tmp_path, [{field: value}]), "MMStar")[0]
++
++
++def test_data_uri_and_paths(tmp_path):
++    image_path = tmp_path / "photo.png"
++    image_path.write_bytes(PNG)
++    path = make_tsv(
++        tmp_path, [{"image": "photo.png"}, {"image": str(image_path)}, {"image": "data:image/png;base64," + PNG_BASE64}]
++    )
++    items = list(VLMEvalMCQDataset(path, "MMStar"))
++    assert items[0]["image"] == items[1]["image"] == str(image_path)
++    assert all(Path(item["image"]).read_bytes() == PNG for item in items)
++
++
++def test_string_ids_literal_na_and_optional_choices(tmp_path):
++    path = make_tsv(tmp_path, [{"index": "001", "A": "NA", "C": "", "D": "", "Z": "last"}])
++    item = VLMEvalMCQDataset(path, "MMStar")[0]
++    assert item["sample_id"] == "001"
++    assert item["choices"] == {"A": "NA", "B": "blue", "Z": "last"}
++
++
++def test_path_precedes_identically_named_reference(tmp_path):
++    (tmp_path / "0").write_bytes(PNG)
++    path = make_tsv(tmp_path, [{"image": "0"}])
++    assert VLMEvalMCQDataset(path, "MMStar")[0]["image"] == str(tmp_path / "0")
++
++
++def test_cache_content_not_sample_id_and_large_base64(tmp_path):
++    path = make_tsv(tmp_path)
++    first = VLMEvalMCQDataset(path, "MMStar")[0]["image"]
++    # Valid magic plus a long payload exercises ENAMETOOLONG on path probing.
++    changed = PNG + b"padding" * 1000
++    make_tsv(tmp_path, [{"image": base64.b64encode(changed).decode()}])
++    second = VLMEvalMCQDataset(path, "MMStar")[0]["image"]
++    assert first != second
++    assert Path(first).read_bytes() == PNG and Path(second).read_bytes() == changed
++
++
++def test_atomic_cache_concurrent_writers_and_repair(tmp_path):
++    path = make_tsv(tmp_path)
++
++    def load_image(_):
++        return Path(VLMEvalMCQDataset(path, "MMStar")[0]["image"])
++
++    with ThreadPoolExecutor(max_workers=8) as pool:
++        images = list(pool.map(load_image, range(16)))
++    assert len(set(images)) == 1
++    assert images[0].read_bytes() == PNG
++    assert list(images[0].parent.iterdir()) == [images[0]]
++    images[0].write_bytes(b"partial")
++    assert load_image(0).read_bytes() == PNG
++
++
++@pytest.mark.parametrize(
++    "header,suffix",
++    [
++        (PNG, ".png"),
++        (b"\xff\xd8\xff\xe0", ".jpg"),
++        (b"GIF89a", ".gif"),
++        (b"GIF87a", ".gif"),
++        (b"RIFF1234WEBP", ".webp"),
++    ],
++)
++def test_image_magic(header, suffix):
++    assert VLMEvalMCQDataset._image_suffix(header) == suffix
++
++
++@pytest.mark.parametrize(
++    "prediction,expected",
++    [
++        ("B", "B"),
++        ("(B).", "B"),
++        ("The correct answer is **C**.", "C"),
++        ("Final answer: option A", "A"),
++        ('{"answer": "B"}', "B"),
++        ("{'answer': 'b'}", "B"),
++        (r"\boxed{D}", "D"),
++        ("<think>A or B</think>C", "C"),
++        ('<think>{"answer": "A"}</think><think>B</think>{"answer": "C"}', "C"),
++        ("blue", "B"),
++        ("The object is green.", "C"),
++        ("A or B", None),
++        ('{"answer":"A", "answer":"B"}', None),
++        ('{"answer":"Z"} blue', None),
++        ("Answer is A. Answer is B.", None),
++        ("blue or green", None),
++        ("Answer is A or B", None),
++        ("The answer is a blue object.", "B"),
++        ("blueberry", None),
++        ("", None),
++        ("I cannot tell.", None),
++        ("B is a possible interpretation but there is no clear conclusion here", None),
++        ("blue " + "reasoning " * 100, None),
++    ],
++)
++def test_extract_choice(prediction, expected):
++    assert extract_choice(prediction, CHOICES) == expected
++
++
++def test_metrics_and_json(tmp_path):
++    evaluator = VLMEvalMCQEvaluator(str(tmp_path / "results"), "qwen3_5", "mmstar")
++    base = {
++        "sample_id": "0",
++        "question": "颜色？",
++        "answer": "B",
++        "choices": CHOICES,
++        "category": "color",
++        "l2_category": "basic",
++    }
++    evaluator.update(base, "B")
++    evaluator.update({**base, "sample_id": "1"}, "A or B")
++    metrics = evaluator.finalize()
++    assert metrics == {
++        "overall": 50.0,
++        "correct": 1,
++        "total": 2,
++        "invalid_predictions": 1,
++        "category": {"color": 50.0},
++        "l2_category": {"basic": 50.0},
++    }
++    records = json.loads((tmp_path / "results/qwen3_5_mmstar_predictions.json").read_text())
++    assert records[1]["prediction"] == "A or B" and records[1]["extracted_choice"] is None
++    assert json.loads((tmp_path / "results/qwen3_5_mmstar_metrics.json").read_text()) == metrics
++    assert evaluator.compute() == metrics
++
++
++def test_wrong_valid_answer_is_not_invalid_and_empty_metrics(tmp_path):
++    evaluator = VLMEvalMCQEvaluator(str(tmp_path), "model", "test")
++    assert evaluator.compute() == {"overall": 0.0, "correct": 0, "total": 0, "invalid_predictions": 0}
++    evaluator.update({"sample_id": "0", "question": "Q", "answer": "B", "choices": CHOICES}, "A")
++    assert evaluator.compute() == {"overall": 0.0, "correct": 0, "total": 1, "invalid_predictions": 0}
++
++
++@pytest.mark.parametrize("key,name", [("mmstar", "MMStar"), ("realworldqa", "RealWorldQA")])
++def test_registration_builder_signature(tmp_path, key, name):
++    make_tsv(tmp_path, name=name + ".tsv")
++    assert len(eval_dataset_dict[key](tmp_path, max_samples=1)) == 1
++    assert eval_impl_dict[key] is VLMEvalMCQEvaluator
++    assert "vqa2_val" in eval_dataset_dict and "vqa2_val" in eval_impl_dict
+diff --git a/tests/ut_fsdp/inference/test_infer_engine.py b/tests/ut_fsdp/inference/test_infer_engine.py
+new file mode 100644
+index 0000000..e64e4d4
+--- /dev/null
++++ b/tests/ut_fsdp/inference/test_infer_engine.py
+@@ -0,0 +1,127 @@
++"""No model loading: fake adapters exercise timing and rank ownership."""
++
++import os
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import torch
++
++os.environ.setdefault("NON_MEGATRON", "true")
++
++from mindspeed_mm.fsdp.inference import infer_engine
++
++
++class FakeAdapter:
++    def __init__(self, events):
++        self.events = events
++        self.generated = []
++        self.decoded = []
++
++    def preprocess(self, messages):
++        self.current = messages[0]["index"]
++        return {"input_ids": torch.ones((1, 2), dtype=torch.long)}
++
++    def generate(self, inputs, generation):
++        self.events.append("generate")
++        self.generated.append(self.current)
++        return torch.ones((1, 4 + self.current), dtype=torch.long)
++
++    def decode(self, inputs, outputs):
++        self.decoded.append(self.current)
++        return "B"
++
++
++def make_engine(monkeypatch, rank=0, world_size=2, count=2, replicated=True):
++    events = []
++    monkeypatch.setattr(infer_engine.dist, "get_rank", lambda: rank)
++    monkeypatch.setattr(infer_engine.dist, "get_world_size", lambda: world_size)
++    monkeypatch.setattr(infer_engine, "synchronize", lambda: events.append("sync"))
++    # Total start; two generate intervals of 1 s and 3 s; total finish.
++    times = iter([0.0, 10.0, 11.0, 20.0, 23.0, 30.0] if count else [0.0, 0.0])
++
++    def clock():
++        events.append("clock")
++        return next(times)
++
++    monkeypatch.setattr(infer_engine.time, "perf_counter", clock)
++    messages = []
++    monkeypatch.setattr(infer_engine, "print_rank", lambda function, value: messages.append(value))
++    adapter = FakeAdapter(events)
++    engine = infer_engine.InferEngine(
++        SimpleNamespace(inference=SimpleNamespace(generation=object())),
++        adapter,
++        [{"text": f"sample {index}"} for index in range(count)],
++        count,
++        replicated_inputs=replicated,
++    )
++    return engine, adapter, events, messages
++
++
++def sample_builder(item, index):
++    return [{"index": index}]
++
++
++def test_replicated_rank_zero_and_weighted_throughput(monkeypatch):
++    engine, adapter, events, messages = make_engine(monkeypatch)
++    gather = Mock(side_effect=AssertionError("Replicated inputs must not gather duplicate predictions"))
++    monkeypatch.setattr(engine, "gather_batch_results", gather)
++    results = engine.infer(sample_builder)
++    assert len(results) == 2
++    assert adapter.generated == adapter.decoded == [0, 1]
++    assert [result["global_index"] for _, result in results] == [0, 1]
++    assert [result["inference_duration"] for _, result in results] == [1.0, 3.0]
++    assert events == [
++        "clock",
++        "sync",
++        "clock",
++        "generate",
++        "sync",
++        "clock",
++        "sync",
++        "clock",
++        "generate",
++        "sync",
++        "clock",
++        "clock",
++    ]
++    assert "Total generate duration: 4.0000 seconds" in messages
++    # (2 + 3) / (1 + 3) = 1.25, not mean(2/1, 3/3) = 1.5 or x world_size.
++    assert "Decode throughput: 1.25 tokens/second" in messages
++    gather.assert_not_called()
++
++
++def test_replicated_other_rank_still_generates_every_sample(monkeypatch):
++    engine, adapter, _, _ = make_engine(monkeypatch, rank=1)
++    assert engine.infer(sample_builder) == []
++    assert adapter.generated == [0, 1]
++    assert adapter.decoded == []
++
++
++def test_empty_input_has_zero_throughput(monkeypatch):
++    engine, adapter, _, messages = make_engine(monkeypatch, count=0)
++    assert engine.infer(sample_builder) == []
++    assert adapter.generated == []
++    assert "Decode throughput: 0.00 tokens/second" in messages
++
++
++def test_existing_partitioned_path_still_gathers(monkeypatch):
++    engine, adapter, _, _ = make_engine(monkeypatch, rank=1, replicated=False)
++    gather = Mock(return_value=[])
++    monkeypatch.setattr(engine, "gather_batch_results", gather)
++    engine.infer(sample_builder)
++    assert adapter.generated == [1, 0]  # Second local item is sampler padding.
++    assert gather.call_count == 2
++    assert gather.call_args_list[0].args[0][1]["global_index"] == 1
++    assert gather.call_args_list[1].args == (None,)
++
++
++def test_gather_sorts_and_excludes_padding(monkeypatch):
++    monkeypatch.setattr(infer_engine.dist, "get_rank", lambda: 0)
++    monkeypatch.setattr(infer_engine.dist, "get_world_size", lambda: 3)
++
++    def gather(result, output, dst):
++        assert dst == 0
++        output[:] = [({}, {"global_index": 2}), None, ({}, {"global_index": 0})]
++
++    monkeypatch.setattr(infer_engine.dist, "gather_object", gather)
++    assert [item[1]["global_index"] for item in infer_engine.InferEngine.gather_batch_results(None)] == [0, 2]
+diff --git a/tests/ut_fsdp/inference/test_inference_data_flow.py b/tests/ut_fsdp/inference/test_inference_data_flow.py
+new file mode 100644
+index 0000000..e152808
+--- /dev/null
++++ b/tests/ut_fsdp/inference/test_inference_data_flow.py
+@@ -0,0 +1,111 @@
++"""Test real runner/data flow while replacing unused model-loading boundaries."""
++
++import importlib
++import json
++import os
++import sys
++from types import ModuleType, SimpleNamespace
++from unittest.mock import Mock, patch
++
++import pytest
++
++os.environ.setdefault("NON_MEGATRON", "true")
++
++
++@pytest.fixture
++def runner_module():
++    # These tests never build a model, initialize a device, or load weights.
++    # Stub only those boundaries so the data-flow tests also run on CPU hosts
++    # without training-only packages such as peft/datasets/fla-npu.
++    boundaries = {
++        "mindspeed_mm.config.config_manager": ["ConfigManager"],
++        "mindspeed_mm.fsdp.checkpoint.dcp_checkpointer": ["DistributedCheckpointer"],
++        "mindspeed_mm.fsdp.checkpoint.hf_checkpointer": ["HuggingFaceCheckpointer"],
++        "mindspeed_mm.fsdp.checkpoint.hf_utils": ["looks_like_hf_weight_dir"],
++        "mindspeed_mm.fsdp.checkpoint.utils": ["retie_embeddings"],
++        "mindspeed_mm.fsdp.distributed.torch_parallelize": ["ParallelApplier"],
++        "mindspeed_mm.fsdp.models.modelhub": ["ModelHub"],
++        "mindspeed_mm.fsdp.utils.utils": ["to_empty_if_needed"],
++    }
++    modules = {}
++    for name, symbols in boundaries.items():
++        module = ModuleType(name)
++        for symbol in symbols:
++            setattr(module, symbol, Mock())
++        modules[name] = module
++    with patch.dict(sys.modules, modules):
++        # Ensure each fixture imports the actual runner with these boundaries.
++        for name in ("mindspeed_mm.fsdp.inference.inference_runner", "mindspeed_mm.fsdp.evaluation.evaluation_runner"):
++            sys.modules.pop(name, None)
++        yield importlib.import_module("mindspeed_mm.fsdp.inference.inference_runner")
++
++
++@pytest.mark.parametrize("rank", [0, 1, 2, 3])
++def test_replicated_dataloader_full_order_on_every_rank(runner_module, monkeypatch, rank):
++    monkeypatch.setattr(runner_module.dist, "get_world_size", lambda: 4)
++    monkeypatch.setattr(runner_module.dist, "get_rank", lambda: rank)
++    samples = [{"sample_id": str(index)} for index in range(5)]
++    loader = runner_module.InferenceRunner.get_dataloader(samples, replicated_inputs=True)
++    assert list(loader) == samples
++
++
++def test_legacy_dataloader_still_partitions_and_pads(runner_module, monkeypatch):
++    monkeypatch.setattr(runner_module.dist, "get_world_size", lambda: 2)
++    samples = [{"sample_id": str(index)} for index in range(3)]
++    for rank, expected in [(0, [samples[0], samples[2]]), (1, [samples[1], samples[0]])]:
++        monkeypatch.setattr(runner_module.dist, "get_rank", lambda: rank)
++        assert list(runner_module.InferenceRunner.get_dataloader(samples)) == expected
++
++
++def test_runner_propagates_replicated_inputs_to_engine(runner_module, monkeypatch):
++    cls = runner_module.InferenceRunner
++    for method in ("initialize", "get_model", "get_adapter"):
++        monkeypatch.setattr(cls, method, lambda self: None)
++    data = [{"sample_id": "0", "text": "test"}]
++    runner = cls(SimpleNamespace(), data_provider=lambda args: data, replicated_inputs=True)
++    assert runner.engine.replicated_inputs is True
++    assert list(runner.engine.inference_dataloader) == data
++
++
++@pytest.mark.parametrize("dataset,replicated", [("mmstar", True), ("realworldqa", True), ("vqa2_val", False)])
++def test_evaluation_selects_replicated_inputs_only_for_new_tasks(
++    runner_module, monkeypatch, tmp_path, dataset, replicated
++):
++    module = importlib.import_module("mindspeed_mm.fsdp.evaluation.evaluation_runner")
++    runner = Mock()
++    monkeypatch.setattr(module, "InferenceRunner", runner)
++    args = SimpleNamespace(
++        evaluation=SimpleNamespace(dataset_type=dataset, result_output_path=str(tmp_path)),
++        inference=SimpleNamespace(adapter="qwen3_5"),
++    )
++    module.EvaluationRunner(args)
++    assert runner.call_args.kwargs["replicated_inputs"] is replicated
++
++
++@pytest.mark.parametrize("rank", [0, 1])
++def test_evaluation_infers_on_all_ranks_but_writes_once(runner_module, monkeypatch, tmp_path, rank):
++    module = importlib.import_module("mindspeed_mm.fsdp.evaluation.evaluation_runner")
++    fake_runner = Mock()
++    fake_runner.infer.return_value = [
++        (
++            {"sample_id": "0", "question": "Q", "choices": {"A": "one", "B": "two"}, "answer": "B"},
++            {"output_text": '{"answer":"B"}'},
++        )
++    ]
++    monkeypatch.setattr(module, "InferenceRunner", Mock(return_value=fake_runner))
++    monkeypatch.setattr(module.dist, "is_initialized", lambda: True)
++    monkeypatch.setattr(module.dist, "get_rank", lambda: rank)
++    monkeypatch.setattr(module, "print_rank", lambda *args: None)
++    args = SimpleNamespace(
++        evaluation=SimpleNamespace(dataset_type="mmstar", result_output_path=str(tmp_path)),
++        inference=SimpleNamespace(adapter="qwen3_5"),
++    )
++    evaluator = module.EvaluationRunner(args)
++    evaluator.evaluate()
++    fake_runner.infer.assert_called_once()
++    if rank == 0:
++        metrics = json.loads((tmp_path / "qwen3_5_mmstar_metrics.json").read_text())
++        records = json.loads((tmp_path / "qwen3_5_mmstar_predictions.json").read_text())
++        assert metrics["total"] == len(records) == 1 and metrics["overall"] == 100.0
++    else:
++        assert list(tmp_path.iterdir()) == []
+diff --git a/tests/ut_fsdp/inference/test_logits_processors.py b/tests/ut_fsdp/inference/test_logits_processors.py
+new file mode 100644
+index 0000000..dabf36f
+--- /dev/null
++++ b/tests/ut_fsdp/inference/test_logits_processors.py
+@@ -0,0 +1,74 @@
++import os
++
++import pytest
++import torch
++from transformers import LogitsProcessorList
++
++os.environ.setdefault("NON_MEGATRON", "true")
++
++from mindspeed_mm.fsdp.inference.logits_processors import PresencePenaltyLogitsProcessor
++from mindspeed_mm.fsdp.params.inference_args import GenerationArguments
++
++
++@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
++def test_presence_penalty_response_only_once_per_token_and_batch(dtype):
++    processor = PresencePenaltyLogitsProcessor(1.5)
++    scores = torch.full((2, 8), 3.0, dtype=dtype)
++    prompt = torch.tensor([[1, 2, 3], [4, 5, 6]])
++    assert processor(prompt, scores) is scores
++    ids = torch.cat((prompt, torch.tensor([[4, 4, 5], [1, 1, 2]])), dim=1)
++    actual = LogitsProcessorList([processor])(ids, scores)
++    expected = scores.clone()
++    expected[0, [4, 5]] -= 1.5
++    expected[1, [1, 2]] -= 1.5
++    torch.testing.assert_close(actual, expected)
++    torch.testing.assert_close(scores, torch.full_like(scores, 3.0))
++
++
++def test_zero_penalty_returns_original_scores():
++    processor = PresencePenaltyLogitsProcessor(0)
++    scores = torch.zeros(1, 10)
++    processor(torch.tensor([[1, 2]]), scores)
++    assert processor(torch.tensor([[1, 2, 3]]), scores) is scores
++
++
++@pytest.mark.parametrize("penalty", [float("inf"), float("-inf"), float("nan")])
++def test_non_finite_penalty_rejected(penalty):
++    with pytest.raises(ValueError, match="finite"):
++        PresencePenaltyLogitsProcessor(penalty)
++
++
++def test_official_generation_kwargs_and_fresh_processor():
++    args = GenerationArguments(
++        max_new_tokens=32768, do_sample=True, temperature=1.0, top_p=0.95, top_k=20, min_p=0.0, presence_penalty=1.5
++    )
++    first = args.to_generate_kwargs(distributed=True)
++    second = args.to_generate_kwargs(distributed=True)
++    assert {key: value for key, value in first.items() if key != "logits_processor"} == {
++        "max_new_tokens": 32768,
++        "do_sample": True,
++        "temperature": 1.0,
++        "top_p": 0.95,
++        "top_k": 20,
++        "min_p": 0.0,
++        "synced_gpus": True,
++        "repetition_penalty": 1.0,
++        "use_cache": True,
++    }
++    assert len(first["logits_processor"]) == 1
++    assert first["logits_processor"][0].penalty == 1.5
++    assert first["logits_processor"][0] is not second["logits_processor"][0]
++    first["logits_processor"][0](torch.tensor([[1, 2]]), torch.zeros(1, 10))
++    assert second["logits_processor"][0].prompt_length is None
++
++
++@pytest.mark.parametrize("penalty", [None, 0.0])
++def test_old_defaults_and_greedy_omit_sampling_kwargs(penalty):
++    kwargs = GenerationArguments(
++        do_sample=False, temperature=1.0, top_p=0.9, top_k=20, min_p=0.1, presence_penalty=penalty
++    ).to_generate_kwargs()
++    assert kwargs == {"max_new_tokens": 512, "do_sample": False, "repetition_penalty": 1.0, "use_cache": True}
++
++
++def test_presence_penalty_also_applies_to_greedy_decoding():
++    assert len(GenerationArguments(presence_penalty=1.5).to_generate_kwargs()["logits_processor"]) == 1
+-- 
+2.51.1
+
